@@ -1,0 +1,334 @@
+---
+title: "Public Opinion on Abortion"
+author: "Kieran Healy"
+date: '2022-04-08'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+First we load the libraries we'll need.
+
+
+```{r, message=FALSE}
+library(tidyverse)
+library(socviz)
+library(kableExtra)
+library(survey) 
+library(srvyr) # Let survey work with tidyverse
+library(broom)
+library(gssr) # https://kjhealy.github.io/gssr
+
+## Tidy up agegroup
+convert_agegrp <- function(x){
+    x <- gsub("\\(", "", x)
+    x <- gsub("\\[", "", x)
+    x <- gsub("\\]", "", x)
+    x <- gsub(",", "-", x)
+    x <- gsub("-89", "+", x)
+    regex <- "^(.*$)"
+    x <- gsub(regex, "Age \\1", x)
+    x
+}
+
+
+my_colors <- function(palette = "cb"){
+    cb.palette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+        "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+    rcb.palette <- rev(cb.palette)
+    bly.palette <- c("#E69F00", "#0072B2", "#000000", "#56B4E9", 
+        "#009E73", "#F0E442", "#D55E00", "#CC79A7")
+    if (palette == "cb") 
+        return(cb.palette)
+    else if (palette == "rcb") 
+        return(rcb.palette)
+    else if (palette == "bly") 
+        return(bly.palette)
+    else stop("Choose cb, rcb, or bly only.")
+}
+
+```
+
+```{r, message=FALSE, echo=FALSE, results='hide'}
+## Fonts for formatting the plots; not required
+## Just comment this chunk out if necessary 
+
+library(systemfonts)
+clear_registry()
+
+register_variant(
+  name = "Myriad Pro SemiCondensed",
+  family = "Myriad Pro",
+  width = "semicondensed",
+  weight = c("normal", "semibold"),
+)
+
+library(showtext)
+showtext_auto()
+
+library(myriad)
+import_myriad_semi()
+
+
+theme_set(theme_myriad_semi())
+
+```
+
+# GSS Data
+Next, the data.
+
+```{r}
+## From gssr
+data(gss_all)
+gss_all
+```
+
+## Subset
+
+
+```{r}
+
+
+abortion <- c("abdefect", "abnomore", "abhlth", "abpoor", "abrape", "absingle", "abany")
+
+cont_vars <- c("year", "id", "ballot", "age")
+cat_vars <- c(abortion, "sex", "degree", "race")
+wt_vars <- c("vpsu",
+             "vstrat",
+             "oversamp",
+             "formwt",              # weight to deal with experimental randomization
+             "wtssall",             # main weight variable
+             "wtsscomp",            # composite weight for post 2018 issues
+             "sampcode",            # sampling error code
+             "sample")              # sampling frame and method
+my_vars <- c(cont_vars, cat_vars, wt_vars)
+
+## Clean up labeled vars as we go, create compwt
+gss_df <- gss_all %>%
+  filter(year > 1974) %>% 
+  select(all_of(my_vars)) %>% 
+  mutate(across(everything(), haven::zap_missing), # Convert labeled missing to regular NA
+         across(all_of(wt_vars), as.numeric),
+         across(all_of(cat_vars), as_factor), 
+         across(all_of(cat_vars), fct_relabel, tolower),
+         across(all_of(cat_vars), fct_relabel, tools::toTitleCase),
+         compwt = oversamp * formwt * wtssall)
+        
+```
+
+## Recoding
+
+- Make a "young" variable, ages 18-30 
+- Recode the degree measures into HS or lower, Some college, and BA or higher for the respondent (`resp_coll`), father's education (`pa_coll`), and mother's education (`ma_coll`). 
+- Create a measure `pama` flagging if _neither_ parent has a BA or higher. 
+
+```{r}
+
+## Age quartiles
+qrts <- quantile(as.numeric(gss_df$age), na.rm = TRUE)
+
+## Age quintiles
+quintiles <- quantile(as.numeric(gss_df$age), 
+                      probs = seq(0, 1, 0.2), na.rm = TRUE)
+
+gss_df <- gss_df %>% 
+  mutate(
+    young = case_when(age <= 29 ~ "Aged 18-30", 
+                      age >= 30 ~ "Aged 30+", 
+                      TRUE ~ NA_character_),
+    ageq = cut(x = age, breaks = unique(qrts), 
+               include.lowest=TRUE),
+    ageq =  fct_relabel(ageq, convert_agegrp),
+    agequint = cut(x = age, breaks = unique(quintiles), 
+                   include.lowest = TRUE),
+    agequint = fct_relabel(agequint, convert_agegrp),
+    self_coll = fct_collapse(degree,
+      `HS or less` = c("less than High School", 
+                       "High School"), 
+      `Some College` = "Associate/Junior College",
+      `College or more` = c("Bachelor's", "Graduate")),
+    ballot_rc = case_when(
+    is.na(ballot) ~ "No Ballot", 
+    ballot == 1 ~ "Ballot A",
+    ballot == 2 ~ "Ballot B",
+    ballot == 3 ~ "Ballot C",
+    ballot == 4 ~ "Ballot D",
+    TRUE ~ NA_character_))
+
+gss_df_lon <- gss_df |> 
+   pivot_longer(abdefect:abany, names_to = "reason") |> 
+   mutate(reason_rc = case_when(reason == "abdefect" ~ "Strong chance of serious defect",
+                               reason == "abnomore" ~ "She wants no more children",
+                               reason == "abhlth" ~ "Her health is seriously endangered",
+                               reason == "abpoor" ~ "Can't afford more children",
+                               reason == "abrape" ~ "Pregnant as result of rape",
+                               reason == "absingle" ~ "Not married",
+                               reason == "abany" ~ "She wants, for any reason",
+                      TRUE ~ NA_character_))
+
+```
+
+
+
+## Survey-weighted estimates
+
+```{r}
+options(survey.lonely.psu = "adjust")
+options(na.action="na.pass")
+
+## Before 1975 vpsus are not available
+## Abortion questions are on Ballots A and C
+gss_svy <- gss_df_lon %>%
+  filter(year > 1974) %>%  
+  mutate(stratvar = interaction(year, vstrat)) %>%
+  as_survey_design(id = vpsu,
+                     strata = stratvar,
+                     weights = wtsscomp,
+                     nest = TRUE)
+gss_svy
+```
+
+
+```{r}
+
+out_ab <- gss_svy %>%
+  filter(ballot_rc %in% c("No Ballot", "Ballot A", "Ballot C")) |> 
+    group_by(year, reason_rc, value)  |> 
+    filter(!is.na(value)) |> 
+    summarize(prop = survey_mean(na.rm = TRUE, vartype = "ci")) 
+
+out_ab |> 
+  filter(str_detect(reason_rc, "any"), value == "Yes") |> 
+  print(n = Inf) 
+
+
+```
+
+```{r}
+p <- out_ab |>
+  drop_na() |> 
+  filter(value == "Yes", reason_rc %nin% "Not married") |> 
+  ggplot(aes(x = year, y = prop,
+                ymin = prop_low, ymax = prop_upp)) +
+  geom_hline(yintercept = 0.5, linetype = "dotted") +
+  geom_hline(yintercept = 0.0, linetype = "dotted") + 
+  geom_hline(yintercept = 0.25, linetype = "dotted") + 
+  geom_hline(yintercept = 0.75, linetype = "dotted") + 
+  geom_hline(yintercept = 1, linetype = "dotted") + 
+    geom_line(size = 1.2) +
+    geom_ribbon(alpha = 0.3, color = NA) +
+    scale_x_continuous(breaks = seq(1978, 2022, 6)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), 
+                       breaks = c(0.0, 0.25, 0.5, 0.75, 1)) +
+    scale_color_manual(values = my_colors("bly")[1]) +
+    scale_fill_manual(values = my_colors("bly")[1]) +
+     facet_wrap(~ reorder(reason_rc, -prop), ncol = 1) +
+    coord_cartesian(xlim = c(1977, 2023), ylim = c(0,1)) +
+    labs(x = "Year",
+         y = "Percent Agreeing",
+         title = "Public support for abortion\nfor various reasons, 1977-2018",
+         subtitle = "Percent agreeing that a pregnant woman\nshould be able to get a legal abortion if …",
+         caption = "Kieran Healy / @kjhealy / http://socviz.co.\nData source: General Social Survey") +
+  theme_myriad_semi() +
+  theme(plot.title = element_text(face = "bold"), 
+        strip.text = element_text(face = "bold", size = rel(1.1)))
+
+ggsave(filename = "figures/abortion_opinions_3.pdf", 
+       plot = p, height = 12, 
+       width = 4.5)
+
+
+
+```
+
+
+```{r}
+p_any <- out_ab |>
+filter(reason_rc == "She wants, for any reason", 
+         value == "Yes") |> 
+  drop_na() |> 
+  ungroup() |> 
+  ggplot(mapping = aes(x = year, y = prop,
+                ymin = prop_low, ymax = prop_upp,
+                color = )) + 
+  geom_hline(yintercept = 0.5, linetype = "dotted") +
+  geom_hline(yintercept = 0.0, linetype = "dotted") + 
+  geom_hline(yintercept = 0.25, linetype = "dotted") + 
+  geom_hline(yintercept = 0.75, linetype = "dotted") + 
+  geom_hline(yintercept = 1, linetype = "dotted") + 
+  geom_line(size = 1.2) +
+  geom_ribbon(alpha = 0.3, color = NA) +
+  scale_x_continuous(breaks = seq(1978, 2023, 6)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), 
+                       breaks = c(0.0, 0.25, 0.5, 0.75, 1)) +
+    scale_color_manual(values = my_colors("bly")[1]) +
+    scale_fill_manual(values = my_colors("bly")[1]) +
+    coord_cartesian(xlim = c(1977, 2023), ylim = c(0, 0.75)) +
+    labs(x = "Year",
+         y = "Percent Agreeing",
+         title = "Attitudes to Abortion on Demand 1977-2022",
+         subtitle = "Percent agreeing that 'It should be possible for a pregnant woman to obtain\na legal abortion if the woman wants it for any reason.'",
+         caption = "Kieran Healy / @kjhealy / http://socviz.co.\nData source: General Social Survey. Shaded ranges are 90% confidence intervals.") +
+    theme(legend.position = "top")
+
+ggsave(filename = "figures/abortion_any_reason.pdf", p_any, height = 5, width = 8)
+
+```
+
+
+```{r}
+out_by_sex <- gss_svy %>%
+  filter(ballot_rc %in% c("No Ballot", "Ballot A", "Ballot C")) |> 
+    group_by(year, reason_rc, sex, value)  |> 
+    filter(!is.na(value)) |> 
+    summarize(prop = survey_mean(na.rm = TRUE, vartype = "ci", level = 0.9))
+```
+
+```{r}
+p_sex <- out_by_sex |> 
+  filter(reason_rc == "She wants, for any reason", 
+         value == "Yes") |> 
+  drop_na() |> 
+  ungroup() |> 
+  ggplot(mapping = aes(x = year, y = prop,
+                ymin = prop_low, ymax = prop_upp,
+                color = sex, group = sex, fill = sex)) + 
+  geom_hline(yintercept = 0.5, linetype = "dotted") + 
+  geom_line(size = 1.7) +
+    geom_ribbon(alpha = 0.3, color = NA) +
+    scale_x_continuous(breaks = seq(1978, 2018, 4)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), 
+                       breaks = c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7)) +
+    scale_color_manual(values = my_colors("bly")[2:1],
+                       labels = c("Men", "Women"),
+                       guide = guide_legend(title=NULL)) +
+    scale_fill_manual(values = my_colors("bly")[2:1],
+                      labels = c("Men", "Women"),
+                      guide = guide_legend(title=NULL)) +
+    coord_cartesian(xlim = c(1977, 2017), ylim = c(0.2, 0.7)) +
+    labs(x = "Year",
+         y = "Percent Agreeing",
+         title = "Attitudes to Abortion on Demand 1977-2018, amongst Men and Women",
+         subtitle = "Percent agreeing that 'It should be possible for a pregnant woman to obtain\na legal abortion if the woman wants it for any reason.'",
+         caption = "Kieran Healy / @kjhealy / http://socviz.co.\nData source: General Social Survey. Shaded ranges are 90% confidence intervals for each group.") +
+    theme(legend.position = "top")
+
+ggsave(filename = "figures/abortion_sex.pdf", p_sex, height = 5, width = 8)
+
+```
+
+## Support for Abortion Rights Over Time
+
+The likely reversal of _Roe v. Wade_ raises all kinds of questions about the future of abortion provision in the United States. Since the early 1970s, sociologists have asked a representative sample of American households a few specific questions about abortion—over and over again. The [General Social Survey](https://gss.norc.org), or GSS, was established in 1972. Most years since, it has asked respondents whether "it should be possible for a pregnant woman to obtain a legal abortion" under a variety of circumstances. This graph shows trends for six of these questions.
+
+[Figure goes about here]
+
+The panels show the percentage of respondents answering "Yes" in each case, from 1977 to 2018. The top row shows that some circumstances have always commanded a very high level of agreement. About 90% of Americans agree that abortion should be available where the woman's health is seriously endangered. About 75% say it should be legal in cases of pregnancy due to rape, or where there is a strong chance of a serious birth defect. The very stable, very high consensus on these points is easily overlooked. 
+
+The bottom row shows agreement about whether legal abortion should be available if the woman believes she cannot afford more children, if she does not want any more children, or simply for any reason she has. These questions give us some insight into how difficult it is to track opinion over time. The first two questions were originally asked in 1972. The one about wanting no more children refers specifically to married women. It was asked along with another question (not shown here) where the reason is "The woman is single". Questions connecting abortion to marital status are less relevant now than they once were, But as sociologists like to remark, the difficulty with long-run data collection is that if you want to measure change, you can't change the measure. Over time, these answers have probably come to reflect the general orientation of respondents to abortion more than opinions about the specific question of marital status. (For these reasons, the GSS began exploring some new questions about abortion a couple of years ago. Sarah Cowan and Michael Hout, sociologists at New York University, provide an [initial overview](https://as.nyu.edu/content/dam/nyu-as/sociology/documents/Cowan,%20Hout%202019.pdf).)
+
+Still, the great strength of the GSS is its consistency. This makes the final question particularly interesting. Should a pregnant woman be able to obtain a legal abortion for _any_ reason? When it was first asked, in 1977, about 38% of respondents said "Yes". By 2018 this had crept up to almost exactly 50% of those giving an answer. (Only about three or four percent don't have an opinion.) The most recent GSS saw the proportion go up again. As bumper-stickers go, "Abortion on demand for any reason" is pretty direct, even confrontational. And yet, while a position like this would undoubtedly be represented in the media and in politics as being out on the far end of the spectrum of opinion, there is good evidence that it has the support of half the country. 
